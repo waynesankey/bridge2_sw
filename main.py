@@ -6,6 +6,7 @@ import uhashlib
 import json
 import machine
 import socket
+import gc
 from machine import UART, Pin
 
 from config import (
@@ -118,6 +119,29 @@ def log(*args):
     print("[bridge]", *args)
 
 
+def init_status_led():
+    try:
+        return Pin("LED", Pin.OUT)
+    except Exception:
+        try:
+            return Pin(25, Pin.OUT)
+        except Exception:
+            return None
+
+
+async def led_heartbeat_task(led):
+    if led is None:
+        return
+    state = 0
+    while True:
+        state ^= 1
+        try:
+            led.value(state)
+        except Exception:
+            pass
+        await asyncio.sleep_ms(500)
+
+
 def load_wifi_config():
     try:
         with open(WIFI_CONFIG_FILE, "r") as f:
@@ -152,10 +176,17 @@ def wifi_connect(creds, force_ap):
         return start_ap(), "ap", False
 
     wlan = start_sta_connect(creds)
-    if wlan and wlan.isconnected():
-        ip = wlan.ifconfig()[0]
-        log("Connected, IP:", ip)
-        return wlan, "sta", True
+    if wlan:
+        t0 = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), t0) > WIFI_CONNECT_TIMEOUT_MS:
+                log("Wi-Fi connect timeout")
+                break
+            time.sleep_ms(250)
+        if wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+            log("Connected, IP:", ip)
+            return wlan, "sta", True
 
     log("Wi-Fi not connected; check credentials")
     return wlan, "sta", False
@@ -203,14 +234,14 @@ async def sta_connect_task(creds):
     sta_ip = wlan.ifconfig()[0]
     sta_status = "connected"
     sta_task = None
+    ap_setup_mode = False
     log("Connected, IP:", sta_ip)
-    if not ap_setup_mode:
-        try:
-            ap = network.WLAN(network.AP_IF)
-            ap.active(False)
-            log("AP disabled after STA connect")
-        except Exception:
-            pass
+    try:
+        ap = network.WLAN(network.AP_IF)
+        ap.active(False)
+        log("AP disabled after STA connect")
+    except Exception:
+        pass
 
 
 def uart_init():
@@ -898,6 +929,8 @@ async def main():
     ap_page_ssid = creds.get("ssid", "")
 
     wlan, mode, sta_connected = wifi_connect(creds, force_ap)
+    if mode == "sta" and sta_connected:
+        ap_setup_mode = False
     if mode == "sta" and not sta_connected:
         ap_setup_mode = True
         wlan = start_ap()
@@ -912,10 +945,13 @@ async def main():
         except Exception:
             pass
     uart = uart_init()
+    led = init_status_led()
 
+    asyncio.create_task(led_heartbeat_task(led))
     asyncio.create_task(uart_reader_task(uart))
     asyncio.create_task(uart_startup_sync(uart))
 
+    gc.collect()
     server = await asyncio.start_server(
         lambda r, w: handle_http(r, w, uart), HTTP_HOST, HTTP_PORT
     )
