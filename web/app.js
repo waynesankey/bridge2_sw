@@ -22,7 +22,6 @@ const tubeLoadEl = document.getElementById("tubeLoad");
 const tubeSaveEl = document.getElementById("tubeSave");
 const tubeAddEl = document.getElementById("tubeAdd");
 const tubeDeleteEl = document.getElementById("tubeDelete");
-const tubeEditorStatusEl = document.getElementById("tubeEditorStatus");
 
 let ws = null;
 let reconnectTimer = null;
@@ -31,7 +30,25 @@ let labels = {};
 let ampStates = {};
 let tubes = {};
 let currentAmp = null;
+let currentMute = null;
 let pollTimer = null;
+const MAX_QUEUED_LINES = 48;
+let queuedLines = [];
+let syncCooldownUntilMs = 0;
+let pendingSyncTimer = null;
+let lastReconnectKickMs = 0;
+const RECONNECT_KICK_MIN_INTERVAL_MS = 2000;
+let startupPollTimer = null;
+let muteInFlight = false;
+let standbyInFlight = false;
+let muteInFlightTimer = null;
+let standbyInFlightTimer = null;
+let pendingMuteTarget = null;
+let pendingMuteRetryTimer = null;
+let pendingMuteRetriesLeft = 0;
+let pendingStandbyTarget = null;
+let pendingStandbyRetryTimer = null;
+let pendingStandbyRetriesLeft = 0;
 let selectedTubeNum = null;
 let tubeEditorDirty = false;
 let pendingTubeSave = null;
@@ -39,6 +56,8 @@ let pendingTubeDeleteNum = null;
 let pendingTubeDeleteUntilMs = 0;
 let pendingTubeSnapshot = false;
 let tubeSnapshot = {};
+let pendingManualTubeRefresh = false;
+let pendingManualTubeRefreshTimer = null;
 
 function markTubeEditorDirty() {
   tubeEditorDirty = true;
@@ -75,28 +94,209 @@ function scheduleSend(key, line, delayMs) {
   }, delayMs);
 }
 
-function sendLine(line) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    postCommand(line);
-    return;
-  }
-  ws.send(line);
+function debugWs(text) {
+  // intentionally quiet in production UI
 }
 
-async function postCommand(line) {
-  try {
-    const res = await fetch("/api/cmd", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: line,
-    });
-    if (res.ok) {
-      // In HTTP fallback mode, pull fresh state after command ACK/STATE settles.
-      setTimeout(pollState, 180);
+function requestFullSync(delayMs = 0, reason = "manual") {
+  const run = () => {
+    const now = Date.now();
+    if (now < syncCooldownUntilMs) {
+      pendingSyncTimer = setTimeout(run, syncCooldownUntilMs - now);
+      return;
     }
-  } catch (err) {
-    // keep UI responsive; status already reflects disconnect
+    syncCooldownUntilMs = Date.now() + 400;
+    debugWs(`full-sync (${reason})`);
+    sendLine("GET STATE");
+    sendLine("GET SELECTOR_LABELS");
+    sendLine("GET AMP_STATES");
+    requestTubesSnapshot();
+  };
+
+  if (pendingSyncTimer) {
+    clearTimeout(pendingSyncTimer);
+    pendingSyncTimer = null;
   }
+  if (delayMs > 0) {
+    pendingSyncTimer = setTimeout(run, delayMs);
+    return;
+  }
+  run();
+}
+
+function requestStateOnly(reason = "state-only") {
+  const now = Date.now();
+  if (now < syncCooldownUntilMs) {
+    return;
+  }
+  syncCooldownUntilMs = Date.now() + 250;
+  debugWs(`state-sync (${reason})`);
+  sendLine("GET STATE");
+}
+
+function syncOnResume() {
+  const now = Date.now();
+  if (now - lastReconnectKickMs < RECONNECT_KICK_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastReconnectKickMs = now;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    requestStateOnly("resume");
+    return;
+  }
+  connectWebSocket();
+}
+
+function sendStandbyCommand(next) {
+  pendingStandbyTarget = next;
+  pendingStandbyRetriesLeft = 1;
+  standbyInFlight = true;
+  if (standbyInFlightTimer) {
+    clearTimeout(standbyInFlightTimer);
+  }
+  standbyInFlightTimer = setTimeout(() => {
+    pendingStandbyTarget = null;
+    standbyInFlight = false;
+    standbyInFlightTimer = null;
+  }, 45000);
+  if (pendingStandbyRetryTimer) {
+    clearTimeout(pendingStandbyRetryTimer);
+  }
+  pendingStandbyRetryTimer = setTimeout(() => {
+    if (pendingStandbyTarget === null) {
+      pendingStandbyRetryTimer = null;
+      return;
+    }
+    const targetAmp = pendingStandbyTarget === 1 ? 4 : 3;
+    const progressingToOperate = pendingStandbyTarget === 0 && (currentAmp === 1 || currentAmp === 2);
+    if (currentAmp !== targetAmp && !progressingToOperate && pendingStandbyRetriesLeft > 0) {
+      pendingStandbyRetriesLeft -= 1;
+      sendLine(`SET STBY ${pendingStandbyTarget}`);
+    }
+    pendingStandbyRetryTimer = null;
+  }, 450);
+  sendLine(`SET STBY ${next}`);
+}
+
+function sendMuteCommand(next) {
+  pendingMuteTarget = next;
+  pendingMuteRetriesLeft = 1;
+  muteInFlight = true;
+  if (muteInFlightTimer) {
+    clearTimeout(muteInFlightTimer);
+  }
+  muteInFlightTimer = setTimeout(() => {
+    muteInFlight = false;
+    muteInFlightTimer = null;
+  }, 1200);
+  if (pendingMuteRetryTimer) {
+    clearTimeout(pendingMuteRetryTimer);
+  }
+  pendingMuteRetryTimer = setTimeout(() => {
+    if (pendingMuteTarget === null) {
+      pendingMuteRetryTimer = null;
+      return;
+    }
+    if (currentMute !== pendingMuteTarget && pendingMuteRetriesLeft > 0) {
+      pendingMuteRetriesLeft -= 1;
+      sendLine(`SET MUTE ${pendingMuteTarget}`);
+    }
+    pendingMuteRetryTimer = null;
+  }, 320);
+  sendLine(`SET MUTE ${next}`);
+}
+
+function getStandbyIntentFromUi() {
+  const label = String(standbyEl.textContent || "").toLowerCase();
+  if (label.includes("operate")) {
+    return 0;
+  }
+  if (label.includes("standby")) {
+    return 1;
+  }
+  return null;
+}
+
+function queueLine(line) {
+  const text = String(line || "").trim();
+  if (!text) return;
+
+  // Coalesce stateful SET commands so reconnect flushes only latest intent.
+  const m = text.match(/^SET\s+([A-Z_]+)\s+/i);
+  if (m) {
+    const key = `SET ${String(m[1]).toUpperCase()}`;
+    for (let i = queuedLines.length - 1; i >= 0; i -= 1) {
+      const existing = queuedLines[i];
+      if (existing.toUpperCase().startsWith(`${key} `)) {
+        queuedLines.splice(i, 1);
+      }
+    }
+  }
+
+  if (queuedLines.length >= MAX_QUEUED_LINES) {
+    queuedLines.shift();
+  }
+  queuedLines.push(text);
+}
+
+function flushQueuedLines() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !queuedLines.length) {
+    return;
+  }
+  const pending = queuedLines.slice();
+  queuedLines = [];
+  pending.forEach((line) => {
+    try {
+      ws.send(line);
+    } catch (err) {
+      queueLine(line);
+    }
+  });
+}
+
+function sendLine(line) {
+  const text = String(line || "").trim();
+  if (!text) {
+    return;
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(text);
+    return;
+  }
+  if (ws && ws.readyState === WebSocket.CONNECTING) {
+    queueLine(text);
+    return;
+  }
+  postCommand(text).then((ok) => {
+    if (!ok) {
+      queueLine(text);
+      connectWebSocket();
+    }
+  });
+}
+
+async function postCommand(line, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const res = await fetch("/api/cmd", {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: line,
+      });
+      if (res.ok) {
+        // In HTTP fallback mode, pull fresh state after command ACK/STATE settles.
+        setTimeout(pollState, 180);
+        return true;
+      }
+    } catch (err) {
+      // retry below
+    }
+    if (attempt < retries) {
+      // Brief backoff to ride out reconnect/transient network gaps.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+  return false;
 }
 
 async function pollState() {
@@ -189,8 +389,22 @@ function handleStateLine(line) {
   }
   if (state.MUTE !== undefined) {
     const isMuted = Number(state.MUTE) === 1;
+    currentMute = isMuted ? 1 : 0;
     muteEl.textContent = isMuted ? "Mute On" : "Mute Off";
     muteEl.classList.toggle("on", isMuted);
+    if (pendingMuteTarget !== null && currentMute === pendingMuteTarget) {
+      pendingMuteTarget = null;
+      pendingMuteRetriesLeft = 0;
+      if (pendingMuteRetryTimer) {
+        clearTimeout(pendingMuteRetryTimer);
+        pendingMuteRetryTimer = null;
+      }
+    }
+    muteInFlight = false;
+    if (muteInFlightTimer) {
+      clearTimeout(muteInFlightTimer);
+      muteInFlightTimer = null;
+    }
   }
   if (state.AMP !== undefined) {
     const amp = Number(state.AMP);
@@ -198,12 +412,43 @@ function handleStateLine(line) {
       currentAmp = amp;
       updateAmpStateView();
       const isStandby = amp === 4;
-      standbyEl.textContent = isStandby ? "Standby On" : "Standby Off";
+      standbyEl.textContent = isStandby ? "Go To Operate" : "Go To Standby";
       standbyEl.classList.toggle("on", isStandby);
+      if (pendingStandbyTarget !== null) {
+        const targetAmp = pendingStandbyTarget === 1 ? 4 : 3;
+        if (amp === targetAmp) {
+          pendingStandbyTarget = null;
+          pendingStandbyRetriesLeft = 0;
+          standbyInFlight = false;
+          if (standbyInFlightTimer) {
+            clearTimeout(standbyInFlightTimer);
+            standbyInFlightTimer = null;
+          }
+          if (pendingStandbyRetryTimer) {
+            clearTimeout(pendingStandbyRetryTimer);
+            pendingStandbyRetryTimer = null;
+          }
+        } else {
+          standbyInFlight = true;
+        }
+      } else {
+        standbyInFlight = false;
+        if (standbyInFlightTimer) {
+          clearTimeout(standbyInFlightTimer);
+          standbyInFlightTimer = null;
+        }
+        if (pendingStandbyRetryTimer) {
+          clearTimeout(pendingStandbyRetryTimer);
+          pendingStandbyRetryTimer = null;
+        }
+      }
     }
   }
   if (state.TEMP !== undefined) {
-    tempValueEl.textContent = `Temperature: ${state.TEMP}`;
+    const tempText = String(state.TEMP);
+    tempValueEl.textContent = tempText === "NA"
+      ? "Temperature: NA"
+      : `Temperature: ${tempText}\u00B0C`;
   }
 }
 
@@ -263,8 +508,20 @@ function parseIntField(line, key) {
   return m ? Number(m[1]) : null;
 }
 
-function setTubeEditorStatus(text) {
-  tubeEditorStatusEl.textContent = text;
+function setTubeEditorStatus(text, clearAfterMs = 0) {
+  // Tube editor status annunciator removed from UI.
+}
+
+function completeManualTubeRefreshStatus(message = "Tube list refreshed.") {
+  if (!pendingManualTubeRefresh) {
+    return;
+  }
+  pendingManualTubeRefresh = false;
+  if (pendingManualTubeRefreshTimer) {
+    clearTimeout(pendingManualTubeRefreshTimer);
+    pendingManualTubeRefreshTimer = null;
+  }
+  setTubeEditorStatus(message, 1500);
 }
 
 function clearPendingTubeDelete() {
@@ -300,6 +557,7 @@ function applyTubesMap(nextTubes) {
     setTubeEditorFromRecord(tubes[selectedTubeNum]);
   }
   renderTubes();
+  completeManualTubeRefreshStatus();
 }
 
 function requestTubesSnapshot() {
@@ -417,10 +675,32 @@ function parseTubeEditorValues(requireTubeNum) {
 }
 
 function updateAmpStateView() {
+  ampStateValueEl.classList.remove(
+    "state-operate",
+    "state-standby",
+    "state-transition",
+    "state-startup",
+    "state-unknown",
+  );
+
   if (currentAmp === null) {
     ampStateValueEl.textContent = "Unknown";
+    ampStateValueEl.classList.add("state-unknown");
     return;
   }
+
+  if (currentAmp === 3) {
+    ampStateValueEl.classList.add("state-operate");
+  } else if (currentAmp === 4) {
+    ampStateValueEl.classList.add("state-standby");
+  } else if (currentAmp === 1 || currentAmp === 2) {
+    ampStateValueEl.classList.add("state-transition");
+  } else if (currentAmp === 0) {
+    ampStateValueEl.classList.add("state-startup");
+  } else {
+    ampStateValueEl.classList.add("state-unknown");
+  }
+
   const label = ampStates[String(currentAmp)];
   ampStateValueEl.textContent = label || String(currentAmp);
 }
@@ -433,15 +713,17 @@ function connectWebSocket() {
   ws = new WebSocket(wsUrl);
 
   ws.addEventListener("open", () => {
+    debugWs("ws open");
     setStatus("Connected", true);
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    sendLine("GET STATE");
-    sendLine("GET SELECTOR_LABELS");
-    sendLine("GET AMP_STATES");
-    requestTubesSnapshot();
+    if (startupPollTimer) {
+      clearTimeout(startupPollTimer);
+      startupPollTimer = null;
+    }
+    flushQueuedLines();
   });
 
   ws.addEventListener("message", (event) => {
@@ -462,6 +744,23 @@ function connectWebSocket() {
         tubeSnapshot = {};
       } else {
         renderTubes();
+        completeManualTubeRefreshStatus();
+      }
+    } else if (
+      line.startsWith("ACK MUTE START")
+      || line.startsWith("ACK MUTE DONE")
+      || line.startsWith("ACK STBY START")
+      || line.startsWith("ACK STBY DONE")
+    ) {
+      debugWs(line);
+      if (line.startsWith("ACK MUTE START")) {
+        // consumed for reliability/debug; no UI annunciator needed
+      } else if (line.startsWith("ACK MUTE DONE")) {
+        // consumed for reliability/debug; no UI annunciator needed
+      } else if (line.startsWith("ACK STBY START")) {
+        // consumed for reliability/debug; no UI annunciator needed
+      } else if (line.startsWith("ACK STBY DONE")) {
+        // consumed for reliability/debug; no UI annunciator needed
       }
     } else if (
       line.startsWith("ACK TUBE")
@@ -489,13 +788,30 @@ function connectWebSocket() {
       }
       setTimeout(requestTubesSnapshot, 250);
     } else if (line.startsWith("ERR")) {
+      pendingManualTubeRefresh = false;
+      if (pendingManualTubeRefreshTimer) {
+        clearTimeout(pendingManualTubeRefreshTimer);
+        pendingManualTubeRefreshTimer = null;
+      }
       pendingTubeSave = null;
       clearPendingTubeDelete();
+      pendingStandbyTarget = null;
+      pendingStandbyRetriesLeft = 0;
+      standbyInFlight = false;
+      if (standbyInFlightTimer) {
+        clearTimeout(standbyInFlightTimer);
+        standbyInFlightTimer = null;
+      }
+      if (pendingStandbyRetryTimer) {
+        clearTimeout(pendingStandbyRetryTimer);
+        pendingStandbyRetryTimer = null;
+      }
       setTubeEditorStatus(line);
     }
   });
 
   ws.addEventListener("close", () => {
+    debugWs("ws close");
     setStatus("Disconnected", false);
     if (!pollTimer) {
       pollTimer = setInterval(pollState, 1000);
@@ -509,6 +825,7 @@ function connectWebSocket() {
   });
 
   ws.addEventListener("error", () => {
+    debugWs("ws error");
     setStatus("Error", false);
   });
 }
@@ -548,24 +865,48 @@ brightnessEl.addEventListener("input", (event) => {
 });
 
 muteEl.addEventListener("click", () => {
-  const isMuted = muteEl.classList.contains("on");
-  const next = isMuted ? 0 : 1;
-  sendLine(`SET MUTE ${next}`);
+  const next = currentMute === null
+    ? (muteEl.classList.contains("on") ? 0 : 1)
+    : (currentMute === 1 ? 0 : 1);
+  sendMuteCommand(next);
 });
 
 standbyEl.addEventListener("click", () => {
-  const isStandby = standbyEl.classList.contains("on");
-  const next = isStandby ? 0 : 1;
-  sendLine(`SET STBY ${next}`);
+  if (standbyInFlight) {
+    return;
+  }
+  let next = null;
+  if (currentAmp === 4) {
+    next = 0;
+  } else if (currentAmp === 3) {
+    next = 1;
+  } else {
+    next = getStandbyIntentFromUi();
+  }
+  if (next === null) {
+    sendLine("GET STATE");
+    return;
+  }
+  sendStandbyCommand(next);
 });
 
 refreshEl.addEventListener("click", () => {
-  sendLine("GET STATE");
-  sendLine("GET SELECTOR_LABELS");
-  sendLine("GET AMP_STATES");
+  requestFullSync(0, "refresh-btn");
 });
 
 refreshTubesEl.addEventListener("click", () => {
+  pendingManualTubeRefresh = true;
+  if (pendingManualTubeRefreshTimer) {
+    clearTimeout(pendingManualTubeRefreshTimer);
+  }
+  pendingManualTubeRefreshTimer = setTimeout(() => {
+    if (!pendingManualTubeRefresh) {
+      return;
+    }
+    pendingManualTubeRefresh = false;
+    pendingManualTubeRefreshTimer = null;
+    setTubeEditorStatus("Tube refresh timed out.", 1800);
+  }, 3500);
   setTubeEditorStatus("Refreshing tube list...");
   clearTubeEditorDirty();
   requestTubesSnapshot();
@@ -651,21 +992,23 @@ tubeMinEl.addEventListener("input", markTubeEditorDirty);
 
 updateInputOptions();
 connectWebSocket();
-pollState();
+startupPollTimer = setTimeout(() => {
+  startupPollTimer = null;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    pollState();
+  }
+}, 1200);
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
-    forceReconnectWebSocket();
-    pollState();
+    syncOnResume();
   }
 });
 
 window.addEventListener("focus", () => {
-  forceReconnectWebSocket();
-  pollState();
+  syncOnResume();
 });
 
 window.addEventListener("pageshow", () => {
-  forceReconnectWebSocket();
-  pollState();
+  syncOnResume();
 });

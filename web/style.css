@@ -230,10 +230,10 @@ button {
 }
 
 .input-btn.active {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
-  box-shadow: 0 8px 18px rgba(15, 123, 108, 0.3);
+  background: #e5f7ec;
+  border-color: #2f9d5d;
+  color: #1f6c40;
+  box-shadow: 0 0 0 2px rgba(47, 157, 93, 0.15);
 }
 
 #mute,
@@ -243,12 +243,57 @@ button {
 
 .control-btn {
   min-width: 160px;
+  background: #f6f1e9;
+  border-color: rgba(83, 73, 64, 0.3);
+  color: #3f3730;
+  box-shadow: 0 4px 10px rgba(35, 27, 20, 0.08);
+}
+
+.control-btn.on {
+  background: #e8efe9;
+  border-color: #7ea08f;
+  color: #2d5a47;
+  box-shadow: 0 4px 12px rgba(60, 120, 92, 0.14);
 }
 
 .state-badge {
   cursor: default;
   min-width: 220px;
   text-align: center;
+}
+
+.state-badge.state-operate {
+  background: #e5f7ec;
+  border-color: #2f9d5d;
+  color: #1f6c40;
+  box-shadow: 0 0 0 2px rgba(47, 157, 93, 0.15);
+}
+
+.state-badge.state-standby {
+  background: #e8eef5;
+  border-color: #476886;
+  color: #304a62;
+  box-shadow: 0 0 0 2px rgba(71, 104, 134, 0.16);
+}
+
+.state-badge.state-transition {
+  background: #fff3dc;
+  border-color: #c77f1e;
+  color: #8b560e;
+  box-shadow: 0 0 0 2px rgba(199, 127, 30, 0.18);
+}
+
+.state-badge.state-startup {
+  background: #ede7f8;
+  border-color: #6a59a5;
+  color: #4f3f86;
+  box-shadow: 0 0 0 2px rgba(106, 89, 165, 0.18);
+}
+
+.state-badge.state-unknown {
+  background: #f0ece7;
+  border-color: #8a7f73;
+  color: #5f564c;
 }
 
 .temp-badge {
@@ -275,10 +320,24 @@ button.toggle.on {
   box-shadow: 0 6px 16px rgba(15, 123, 108, 0.25);
 }
 
+button.control-btn {
+  background: #f6f1e9;
+  border-color: rgba(83, 73, 64, 0.3);
+  color: #3f3730;
+  box-shadow: 0 4px 10px rgba(35, 27, 20, 0.08);
+}
+
+button.control-btn.on {
+  background: #e8efe9;
+  border-color: #7ea08f;
+  color: #2d5a47;
+  box-shadow: 0 4px 12px rgba(60, 120, 92, 0.14);
+}
+
 button.ghost {
   background: transparent;
   color: var(--accent);
-  border: 1px dashed var(--accent);
+  border: 1px solid var(--accent);
 }
 
 .action-group {
@@ -356,13 +415,6 @@ button.ghost {
   flex-wrap: wrap;
   gap: 10px;
 }
-
-.tube-editor-status {
-  min-height: 1.2em;
-  color: var(--muted);
-  font-size: 0.92rem;
-}
-
 
 @keyframes floatIn {
   from {

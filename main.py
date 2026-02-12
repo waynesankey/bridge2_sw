@@ -50,10 +50,19 @@ uart_rx_buffer = ""
 uart_last_rx_ms = 0
 uart_tx_queue = []
 uart_tx_event = None
+uart_last_get_ms = {}
 sta_status = "idle"
 sta_ip = ""
 sta_wlan = None
 sta_task = None
+
+GET_DEDUP_MS = 350
+GET_DEDUP_COMMANDS = (
+    "GET STATE",
+    "GET SELECTOR_LABELS",
+    "GET AMP_STATES",
+    "GET TUBES",
+)
 
 AP_PAGE = """<!doctype html>
 <html lang="en">
@@ -264,7 +273,7 @@ def uart_init():
 
 
 def uart_send(uart, line):
-    global tube_lines, tubes_end_seen, uart_tx_event
+    global tube_lines, tubes_end_seen, uart_tx_event, uart_last_get_ms
     cmd = line.strip().upper()
     if cmd == "GET TUBES":
         tube_lines = {}
@@ -272,6 +281,17 @@ def uart_send(uart, line):
     text = line.strip()
     if not text:
         return
+
+    if cmd in GET_DEDUP_COMMANDS:
+        for queued in uart_tx_queue:
+            if queued.upper() == cmd:
+                return
+        now = time.ticks_ms()
+        last = uart_last_get_ms.get(cmd)
+        if last is not None and time.ticks_diff(now, last) < GET_DEDUP_MS:
+            return
+        uart_last_get_ms[cmd] = now
+
     uart_tx_queue.append(text)
     if uart_tx_event is not None:
         try:
@@ -290,7 +310,7 @@ async def uart_writer_task(uart):
             continue
         line = uart_tx_queue.pop(0)
         try:
-            uart.write((line + "\n").encode("utf-8"))
+            uart.write((line + "\r\n").encode("utf-8"))
             log("UART ->", line)
         except Exception as exc:
             log("UART write error:", exc)
@@ -690,7 +710,14 @@ async def ws_session(ws, uart):
 async def handle_http(reader, writer, uart):
     request_line = await reader.readline()
     if not request_line:
-        await writer.wait_closed()
+        try:
+            writer.close()
+        except Exception:
+            pass
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
         return
 
     method, path = parse_request_line(request_line)
@@ -713,7 +740,14 @@ async def handle_http(reader, writer, uart):
         key = headers.get("sec-websocket-key")
         if not key:
             log("WS upgrade missing key")
-            await writer.wait_closed()
+            try:
+                writer.close()
+            except Exception:
+                pass
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
             return
         accept = ws_accept_key(key)
         log("WS upgrade accepted for", path)
@@ -855,7 +889,14 @@ async def send_response(writer, status_code, content_type, body):
     writer.write(header.encode("utf-8"))
     writer.write(data)
     await writer.drain()
-    await writer.wait_closed()
+    try:
+        writer.close()
+    except Exception:
+        pass
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
 
 
 async def send_file(writer, path, content_type):
