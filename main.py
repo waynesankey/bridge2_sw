@@ -30,7 +30,7 @@ from config import (
     UART_TX_PIN,
     UART_RX_PIN,
     UART_POLL_MS,
-    UART_STARTUP_SYNC_DELAY_MS,
+    UART_STARTUP_SYNC_DELAY_MS
 )
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -41,9 +41,15 @@ DNS_PORT = 53
 clients = set()
 last_state_line = None
 last_labels_line = None
+last_amp_states_line = None
+tube_lines = {}
+tubes_end_seen = False
 ap_setup_mode = False
 ap_page_ssid = ""
-uart_rx_buffer = b""
+uart_rx_buffer = ""
+uart_last_rx_ms = 0
+uart_tx_queue = []
+uart_tx_event = None
 sta_status = "idle"
 sta_ip = ""
 sta_wlan = None
@@ -258,11 +264,76 @@ def uart_init():
 
 
 def uart_send(uart, line):
-    try:
-        uart.write((line + "\n").encode("utf-8"))
-        log("UART ->", line)
-    except Exception as exc:
-        log("UART write error:", exc)
+    global tube_lines, tubes_end_seen, uart_tx_event
+    cmd = line.strip().upper()
+    if cmd == "GET TUBES":
+        tube_lines = {}
+        tubes_end_seen = False
+    text = line.strip()
+    if not text:
+        return
+    uart_tx_queue.append(text)
+    if uart_tx_event is not None:
+        try:
+            uart_tx_event.set()
+        except Exception:
+            pass
+
+
+async def uart_writer_task(uart):
+    global uart_tx_event
+    uart_tx_event = asyncio.Event()
+    while True:
+        if not uart_tx_queue:
+            uart_tx_event.clear()
+            await uart_tx_event.wait()
+            continue
+        line = uart_tx_queue.pop(0)
+        try:
+            uart.write((line + "\n").encode("utf-8"))
+            log("UART ->", line)
+        except Exception as exc:
+            log("UART write error:", exc)
+        # Pace line writes so receiver line readers do not get overrun.
+        await asyncio.sleep_ms(2)
+
+
+def parse_tube_num(line):
+    for part in line.split():
+        if part.startswith("NUM="):
+            try:
+                return int(part[4:])
+            except Exception:
+                return None
+    return None
+
+
+def parse_tube_fields(line):
+    fields = {}
+    for part in line.split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def has_valid_tube_metrics(line):
+    fields = parse_tube_fields(line)
+    for key in ("NUM", "MIN", "HOUR"):
+        value = fields.get(key)
+        if value is None or not value.isdigit():
+            return False
+    return True
+
+
+def render_tubes_lines():
+    nums = list(tube_lines.keys())
+    nums.sort()
+    lines = [tube_lines[num] for num in nums]
+    if tubes_end_seen and lines:
+        lines.append("END TUBES")
+    return "\n".join(lines)
 
 
 def ws_accept_key(key):
@@ -414,59 +485,160 @@ def normalize_client_command(line):
         return None
 
     upper = raw.upper()
-    if upper.startswith("GET ") or upper.startswith("SET "):
+    if (
+        upper.startswith("GET ")
+        or upper.startswith("SET ")
+        or upper.startswith("ADD ")
+        or upper.startswith("DEL ")
+    ):
         return raw
 
     parts = raw.split()
     if len(parts) == 2:
         key = parts[0].upper()
         value = parts[1]
-        if key in ("VOL", "BAL", "INP", "MUTE", "BRI"):
+        if key in ("VOL", "BAL", "INP", "MUTE", "BRI", "STBY"):
             return "SET %s %s" % (key, value)
 
     return None
 
 
 def handle_uart_line(line):
-    global last_state_line, last_labels_line
+    global last_state_line, last_labels_line, last_amp_states_line, tubes_end_seen
+
+    def strip_embedded_tubes_end(raw):
+        if "END TUBES" in raw:
+            return raw.replace("END TUBES", "").strip(), True
+        if "TUBES_END" in raw:
+            return raw.replace("TUBES_END", "").strip(), True
+        return raw, False
 
     if line.startswith("STATE "):
         last_state_line = line
-        return "state"
+        return "state", [line]
     if line.startswith("SELECTOR_LABELS"):
         last_labels_line = line
-        return "labels"
-    return "other"
+        return "labels", [line]
+    if line.startswith("AMP_STATES"):
+        last_amp_states_line = line
+        return "amp_states", [line]
+    if line.startswith("TUBE "):
+        clean_line, saw_end = strip_embedded_tubes_end(line)
+        num = parse_tube_num(clean_line)
+        is_valid = has_valid_tube_metrics(clean_line)
+        out = []
+        if num is not None and clean_line and is_valid:
+            tube_lines[num] = clean_line
+            out.append(clean_line)
+        if saw_end:
+            tubes_end_seen = True
+            out.append("END TUBES")
+        return "tube", out
+    clean_line, saw_end = strip_embedded_tubes_end(line)
+    if clean_line == "TUBES_END" or clean_line == "END TUBES" or saw_end:
+        tubes_end_seen = True
+        return "tubes_end", ["END TUBES"]
+    return "other", [line]
+
+
+def _next_uart_marker_index(text, start):
+    markers = (
+        "STATE ",
+        "SELECTOR_LABELS",
+        "AMP_STATES",
+        "TUBE ",
+        "ACK ",
+        "DONE SAVE",
+        "ERR ",
+        "END TUBES",
+        "TUBES_END",
+    )
+    found = -1
+    for marker in markers:
+        idx = text.find(marker, start)
+        if idx >= 0 and (found < 0 or idx < found):
+            found = idx
+    return found
+
+
+def extract_uart_frames(buffer, flush_incomplete=False):
+    frames = []
+    text = buffer.replace("\r", "\n")
+
+    while True:
+        text = text.lstrip("\n\t ")
+        if not text:
+            return frames, ""
+
+        first = _next_uart_marker_index(text, 0)
+        if first < 0:
+            if flush_incomplete:
+                line = text.strip()
+                if line:
+                    frames.append(line)
+                return frames, ""
+            return frames, text
+        if first > 0:
+            text = text[first:]
+
+        next_marker = _next_uart_marker_index(text, 1)
+        newline = text.find("\n", 1)
+        cut = -1
+        use_newline = False
+        if newline >= 0 and (next_marker < 0 or newline < next_marker):
+            cut = newline
+            use_newline = True
+        elif next_marker >= 0:
+            cut = next_marker
+
+        if cut < 0:
+            if flush_incomplete:
+                line = text.strip()
+                if line:
+                    frames.append(line)
+                return frames, ""
+            return frames, text
+
+        line = text[:cut].strip()
+        if line:
+            frames.append(line)
+        if use_newline:
+            text = text[cut + 1:]
+        else:
+            text = text[cut:]
 
 
 async def uart_reader_task(uart):
-    global uart_rx_buffer
+    global uart_rx_buffer, uart_last_rx_ms
     while True:
         if uart.any():
             raw = uart.read()
             if raw:
                 if isinstance(raw, str):
                     raw = raw.encode("utf-8")
-                uart_rx_buffer += bytes(raw)
-
-                # Process complete newline-terminated messages only.
-                while b"\n" in uart_rx_buffer:
-                    one, uart_rx_buffer = uart_rx_buffer.split(b"\n", 1)
-                    one = one.strip()
-                    if not one:
-                        continue
-                    try:
-                        line = one.decode("utf-8")
-                    except Exception:
-                        line = "ERR BAD_VALUE"
-
-                    kind = handle_uart_line(line)
+                try:
+                    uart_rx_buffer += bytes(raw).decode("utf-8")
+                except Exception:
+                    uart_rx_buffer += bytes(raw).decode("utf-8", "ignore")
+                uart_last_rx_ms = time.ticks_ms()
+                frames, uart_rx_buffer = extract_uart_frames(uart_rx_buffer, False)
+                for line in frames:
+                    kind, out_lines = handle_uart_line(line)
                     log("UART <-", line)
-                    await broadcast(line)
+                    for out_line in out_lines:
+                        await broadcast(out_line)
 
-                # Guard against runaway buffer if newline never arrives.
-                if len(uart_rx_buffer) > 512:
-                    uart_rx_buffer = b""
+                if len(uart_rx_buffer) > 1024:
+                    uart_rx_buffer = uart_rx_buffer[-256:]
+        elif uart_rx_buffer:
+            idle_ms = time.ticks_diff(time.ticks_ms(), uart_last_rx_ms)
+            if idle_ms > max(50, UART_POLL_MS * 3):
+                frames, uart_rx_buffer = extract_uart_frames(uart_rx_buffer, True)
+                for line in frames:
+                    kind, out_lines = handle_uart_line(line)
+                    log("UART <-", line)
+                    for out_line in out_lines:
+                        await broadcast(out_line)
         await asyncio.sleep_ms(UART_POLL_MS)
 
 
@@ -474,6 +646,8 @@ async def uart_startup_sync(uart):
     await asyncio.sleep_ms(UART_STARTUP_SYNC_DELAY_MS)
     uart_send(uart, "GET STATE")
     uart_send(uart, "GET SELECTOR_LABELS")
+    uart_send(uart, "GET AMP_STATES")
+    uart_send(uart, "GET TUBES")
 
 
 async def ws_session(ws, uart):
@@ -484,6 +658,13 @@ async def ws_session(ws, uart):
             await ws.send_text(last_labels_line)
         if last_state_line:
             await ws.send_text(last_state_line)
+        if last_amp_states_line:
+            await ws.send_text(last_amp_states_line)
+        tubes_text = render_tubes_lines()
+        if tubes_text:
+            for line in tubes_text.split("\n"):
+                if line:
+                    await ws.send_text(line)
 
         while True:
             msg = await ws.recv()
@@ -626,6 +807,12 @@ async def handle_http(reader, writer, uart):
         return
     if path == "/api/labels":
         await send_response(writer, 200, "text/plain", last_labels_line or "")
+        return
+    if path == "/api/amp_states":
+        await send_response(writer, 200, "text/plain", last_amp_states_line or "")
+        return
+    if path == "/api/tubes":
+        await send_response(writer, 200, "text/plain", render_tubes_lines())
         return
 
     if ap_setup_mode:
@@ -948,6 +1135,7 @@ async def main():
     led = init_status_led()
 
     asyncio.create_task(led_heartbeat_task(led))
+    asyncio.create_task(uart_writer_task(uart))
     asyncio.create_task(uart_reader_task(uart))
     asyncio.create_task(uart_startup_sync(uart))
 

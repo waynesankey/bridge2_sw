@@ -136,6 +136,30 @@ h1 {
   grid-template-columns: 140px 1fr;
 }
 
+.state-row {
+  grid-template-columns: 1fr;
+}
+
+.state-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.control-row {
+  grid-template-columns: 1fr;
+}
+
+.control-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.inline-value {
+  text-align: left;
+}
+
 .label {
   font-weight: 600;
   color: var(--ink);
@@ -212,8 +236,23 @@ button {
   box-shadow: 0 8px 18px rgba(15, 123, 108, 0.3);
 }
 
-#mute {
+#mute,
+#standby {
   font-size: 1.25rem;
+}
+
+.control-btn {
+  min-width: 160px;
+}
+
+.state-badge {
+  cursor: default;
+  min-width: 220px;
+  text-align: center;
+}
+
+.temp-badge {
+  min-width: 180px;
 }
 
 button {
@@ -240,6 +279,88 @@ button.ghost {
   background: transparent;
   color: var(--accent);
   border: 1px dashed var(--accent);
+}
+
+.action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tube-table-wrap {
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #fff;
+  overflow: hidden;
+}
+
+.tube-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: #2b241f;
+  font: 600 0.95rem/1.35 "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+}
+
+.tube-table th,
+.tube-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(224, 214, 201, 0.75);
+  text-align: left;
+}
+
+.tube-table thead th {
+  background: #f7f1e7;
+  font-weight: 700;
+}
+
+.tube-table tbody tr {
+  cursor: pointer;
+}
+
+.tube-table tbody tr.selected td {
+  background: rgba(15, 123, 108, 0.12);
+}
+
+.tube-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.tube-editor {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.tube-editor-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr 90px 1fr;
+  gap: 8px 10px;
+  align-items: center;
+}
+
+.tube-editor-grid label {
+  font-weight: 600;
+}
+
+.tube-editor-grid input,
+.tube-editor-grid select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.tube-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tube-editor-status {
+  min-height: 1.2em;
+  color: var(--muted);
+  font-size: 0.92rem;
 }
 
 
@@ -275,5 +396,9 @@ button.ghost {
 
   .value {
     text-align: left;
+  }
+
+  .tube-editor-grid {
+    grid-template-columns: 1fr;
   }
 }

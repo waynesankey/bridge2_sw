@@ -4,13 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SE PRE1 Bridge</title>
-    <link rel="stylesheet" href="/style.css?v=20260204a" />
+    <link rel="stylesheet" href="/style.css?v=20260211d" />
   </head>
   <body>
     <div class="app">
       <header class="top">
         <div>
-          <h1>Ward's Preamp</h1>
+          <h1>4P1L Tube Preamp</h1>
           <!-- subtitle removed -->
         </div>
         <div class="status-wrap">
@@ -20,10 +20,29 @@
       </header>
 
       <section class="panel">
+        <div class="row state-row">
+          <div class="state-group">
+            <button id="ampStateValue" class="toggle state-badge" type="button" disabled>Unknown</button>
+            <button id="tempValue" class="toggle state-badge temp-badge" type="button" disabled>Temperature: NA</button>
+          </div>
+        </div>
+
         <div class="row">
           <label class="label" for="volume">Volume</label>
           <input id="volume" type="range" min="0" max="64" step="1" />
           <div class="value" id="volumeValue">0</div>
+        </div>
+
+        <div class="row row-inline">
+          <label class="label">Input</label>
+          <div class="input-group" id="inputGroup"></div>
+        </div>
+
+        <div class="row control-row">
+          <div class="control-group">
+            <button id="mute" class="toggle control-btn" type="button">Mute Off</button>
+            <button id="standby" class="toggle control-btn" type="button">Standby Off</button>
+          </div>
         </div>
 
         <div class="row">
@@ -39,23 +58,65 @@
         </div>
 
         <div class="row row-inline">
-          <label class="label">Input</label>
-          <div class="input-group" id="inputGroup"></div>
-        </div>
-
-        <div class="row row-inline">
-          <label class="label" for="mute">Mute</label>
-          <button id="mute" class="toggle">Off</button>
-        </div>
-
-        <div class="row row-inline">
           <label class="label">Actions</label>
-          <button id="refresh" class="ghost">Refresh</button>
+          <div class="action-group">
+            <button id="refresh" class="ghost">Refresh</button>
+            <button id="refreshTubes" class="ghost">Refresh Tubes</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">Tube Status</div>
+        <div class="tube-table-wrap">
+          <table class="tube-table" aria-label="Tube Status">
+            <thead>
+              <tr>
+                <th rowspan="2">Tube #</th>
+                <th rowspan="2">Active</th>
+                <th colspan="2">Age</th>
+              </tr>
+              <tr>
+                <th>Hours</th>
+                <th>Minutes</th>
+              </tr>
+            </thead>
+            <tbody id="tubeList">
+              <tr>
+                <td colspan="4">No tube data.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tube-editor">
+          <div class="tube-editor-grid">
+            <label for="tubeNum">Tube #</label>
+            <input id="tubeNum" type="number" min="1" step="1" />
+
+            <label for="tubeActive">Active</label>
+            <select id="tubeActive">
+              <option value="Y">Y</option>
+              <option value="N">N</option>
+            </select>
+
+            <label for="tubeHour">Hours</label>
+            <input id="tubeHour" type="number" min="0" step="1" />
+
+            <label for="tubeMin">Minutes</label>
+            <input id="tubeMin" type="number" min="0" max="59" step="1" />
+          </div>
+          <div class="tube-editor-actions">
+            <button id="tubeLoad" class="ghost" type="button">Load Tube</button>
+            <button id="tubeSave" class="ghost" type="button">Save Tube</button>
+            <button id="tubeAdd" class="ghost" type="button">Add Tube</button>
+            <button id="tubeDelete" class="ghost" type="button">Delete Tube</button>
+          </div>
+          <div id="tubeEditorStatus" class="tube-editor-status"></div>
         </div>
       </section>
 
     </div>
 
-    <script src="/app.js?v=20260204a"></script>
+    <script src="/app.js?v=20260212a"></script>
   </body>
 </html>
