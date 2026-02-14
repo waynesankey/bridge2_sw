@@ -43,6 +43,8 @@ const SYNC_COOLDOWN_FULL_MS = 120;
 const SYNC_COOLDOWN_STATE_MS = 80;
 const HTTP_FALLBACK_STATE_POLL_DELAY_MS = 60;
 const HTTP_FALLBACK_RETRY_BACKOFF_MS = 60;
+const WS_RECONNECT_DELAY_MS = 700;
+const WS_FALLBACK_GRACE_MS = 2200;
 let lastReconnectKickMs = 0;
 const RECONNECT_KICK_MIN_INTERVAL_MS = 2000;
 let startupPollTimer = null;
@@ -67,6 +69,66 @@ let pendingTubeSnapshot = false;
 let tubeSnapshot = {};
 let pendingManualTubeRefresh = false;
 let pendingManualTubeRefreshTimer = null;
+const HTTP_FALLBACK_POLL_INTERVAL_MS = 1200;
+const HTTP_FALLBACK_META_POLL_EVERY = 12;
+let pollInFlight = false;
+let fallbackMetaPollCountdown = 0;
+let suspendCloseInProgress = false;
+let pendingStatePollTimer = null;
+let fallbackStartTimer = null;
+
+function isPageVisible() {
+  return !document.hidden && document.visibilityState === "visible";
+}
+
+function clearPollTimer() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function clearFallbackStartTimer() {
+  if (fallbackStartTimer) {
+    clearTimeout(fallbackStartTimer);
+    fallbackStartTimer = null;
+  }
+}
+
+function schedulePollState(delayMs = HTTP_FALLBACK_STATE_POLL_DELAY_MS) {
+  if (pendingStatePollTimer) {
+    clearTimeout(pendingStatePollTimer);
+  }
+  pendingStatePollTimer = setTimeout(() => {
+    pendingStatePollTimer = null;
+    pollState();
+  }, delayMs);
+}
+
+function scheduleFallbackStart() {
+  if (fallbackStartTimer) {
+    return;
+  }
+  fallbackStartTimer = setTimeout(() => {
+    fallbackStartTimer = null;
+    if (ws) {
+      return;
+    }
+    if (!isPageVisible()) {
+      return;
+    }
+    if (!pollTimer) {
+      pollTimer = setInterval(pollState, HTTP_FALLBACK_POLL_INTERVAL_MS);
+    }
+  }, WS_FALLBACK_GRACE_MS);
+}
 
 function markTubeEditorDirty() {
   tubeEditorDirty = true;
@@ -143,20 +205,24 @@ function requestStateOnly(reason = "state-only") {
   sendLine("GET STATE");
 }
 
+function updateStandbyButtonStyle(isStandby) {
+  standbyEl.classList.toggle("on", !!isStandby);
+  standbyEl.classList.toggle("operate-cta", !!isStandby);
+  standbyEl.classList.toggle("standby-cta", !isStandby);
+}
+
 function syncOnResume() {
+  if (!isPageVisible()) {
+    return;
+  }
   const now = Date.now();
   if (now - lastReconnectKickMs < RECONNECT_KICK_MIN_INTERVAL_MS) {
     return;
   }
   lastReconnectKickMs = now;
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // iOS Safari can keep a stale OPEN socket after long sleep.
-    // Force a clean reconnect if we have not seen traffic for a while.
-    if (wsLastMessageMs && (now - wsLastMessageMs) > 45000) {
-      forceReconnectWebSocket();
-      return;
-    }
-    requestStateOnly("resume");
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    // On iOS wake, always replace the socket to avoid stale or half-open sessions.
+    forceReconnectWebSocket();
     return;
   }
   connectWebSocket();
@@ -329,7 +395,7 @@ async function postCommand(line, retries = 1) {
       });
       if (res.ok) {
         // In HTTP fallback mode, pull fresh state after command ACK/STATE settles.
-        setTimeout(pollState, HTTP_FALLBACK_STATE_POLL_DELAY_MS);
+        schedulePollState(HTTP_FALLBACK_STATE_POLL_DELAY_MS);
         return true;
       }
     } catch (err) {
@@ -344,31 +410,52 @@ async function postCommand(line, retries = 1) {
 }
 
 async function pollState() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    return;
+  }
+  if (!isPageVisible()) {
+    return;
+  }
+  if (pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
   try {
-    const [stateRes, labelsRes, ampStatesRes, tubesRes] = await Promise.all([
-      fetch("/api/state"),
-      fetch("/api/labels"),
-      fetch("/api/amp_states"),
-      fetch("/api/tubes"),
-    ]);
+    const fetchMeta = fallbackMetaPollCountdown <= 0;
+    if (fetchMeta) {
+      fallbackMetaPollCountdown = HTTP_FALLBACK_META_POLL_EVERY;
+    } else {
+      fallbackMetaPollCountdown -= 1;
+    }
+
+    const stateRes = await fetch("/api/state");
     const stateLine = (await stateRes.text()).trim();
-    const labelsLine = (await labelsRes.text()).trim();
-    const ampStatesLine = (await ampStatesRes.text()).trim();
-    const tubesText = (await tubesRes.text()).trim();
     if (stateLine.startsWith("STATE ")) {
       handleStateLine(stateLine);
     }
-    if (labelsLine.startsWith("SELECTOR_LABELS")) {
-      handleLabelsLine(labelsLine);
-    }
-    if (ampStatesLine.startsWith("AMP_STATES")) {
-      handleAmpStatesLine(ampStatesLine);
-    }
-    if (tubesText) {
-      handleTubesText(tubesText);
+    if (fetchMeta) {
+      const [labelsRes, ampStatesRes, tubesRes] = await Promise.all([
+        fetch("/api/labels"),
+        fetch("/api/amp_states"),
+        fetch("/api/tubes"),
+      ]);
+      const labelsLine = (await labelsRes.text()).trim();
+      const ampStatesLine = (await ampStatesRes.text()).trim();
+      const tubesText = (await tubesRes.text()).trim();
+      if (labelsLine.startsWith("SELECTOR_LABELS")) {
+        handleLabelsLine(labelsLine);
+      }
+      if (ampStatesLine.startsWith("AMP_STATES")) {
+        handleAmpStatesLine(ampStatesLine);
+      }
+      if (tubesText) {
+        handleTubesText(tubesText);
+      }
     }
   } catch (err) {
     // best-effort polling fallback
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -457,7 +544,7 @@ function handleStateLine(line) {
       updateAmpStateView();
       const isStandby = amp === 4;
       standbyEl.textContent = isStandby ? "Go To Operate" : "Go To Standby";
-      standbyEl.classList.toggle("on", isStandby);
+      updateStandbyButtonStyle(isStandby);
       if (pendingStandbyTarget !== null) {
         const targetAmp = pendingStandbyTarget === 1 ? 4 : 3;
         if (amp === targetAmp) {
@@ -754,25 +841,36 @@ function connectWebSocket() {
     return;
   }
   const wsUrl = `ws://${window.location.host}/ws`;
-  ws = new WebSocket(wsUrl);
+  const socket = new WebSocket(wsUrl);
+  ws = socket;
 
-  ws.addEventListener("open", () => {
+  socket.addEventListener("open", () => {
+    if (ws !== socket) {
+      return;
+    }
     debugWs("ws open");
     setStatus("Connected", true);
     wsLastMessageMs = Date.now();
+    fallbackMetaPollCountdown = 0;
+    suspendCloseInProgress = false;
+    clearFallbackStartTimer();
     startWsHealthTimer();
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    clearPollTimer();
     if (startupPollTimer) {
       clearTimeout(startupPollTimer);
       startupPollTimer = null;
     }
+    if (pendingStatePollTimer) {
+      clearTimeout(pendingStatePollTimer);
+      pendingStatePollTimer = null;
+    }
     flushQueuedLines();
   });
 
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
+    if (ws !== socket) {
+      return;
+    }
     const line = String(event.data || "").trim();
     if (!line) return;
     wsLastMessageMs = Date.now();
@@ -857,22 +955,36 @@ function connectWebSocket() {
     }
   });
 
-  ws.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
+    if (ws !== socket) {
+      return;
+    }
+    ws = null;
     debugWs("ws close");
     setStatus("Disconnected", false);
     stopWsHealthTimer();
-    if (!pollTimer) {
-      pollTimer = setInterval(pollState, 1000);
+    const code = Number((event && event.code) || 0);
+    const intentional = suspendCloseInProgress || !isPageVisible();
+    const wsOnlyReconnect = code === 1001;
+    if (!intentional && !wsOnlyReconnect) {
+      scheduleFallbackStart();
     }
-    if (!reconnectTimer) {
+    if (!intentional && !reconnectTimer) {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectWebSocket();
-      }, 2000);
+      }, WS_RECONNECT_DELAY_MS);
     }
+    debugWs(
+      `ws close code=${code} intentional=${intentional ? 1 : 0} ws-only=${wsOnlyReconnect ? 1 : 0}`,
+    );
+    suspendCloseInProgress = false;
   });
 
-  ws.addEventListener("error", () => {
+  socket.addEventListener("error", () => {
+    if (ws !== socket) {
+      return;
+    }
     debugWs("ws error");
     setStatus("Error", false);
     stopWsHealthTimer();
@@ -880,10 +992,8 @@ function connectWebSocket() {
 }
 
 function forceReconnectWebSocket() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
+  clearReconnectTimer();
+  clearFallbackStartTimer();
   try {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close();
@@ -1040,18 +1150,24 @@ tubeHourEl.addEventListener("input", markTubeEditorDirty);
 tubeMinEl.addEventListener("input", markTubeEditorDirty);
 
 updateInputOptions();
+updateStandbyButtonStyle(false);
 connectWebSocket();
 startupPollTimer = setTimeout(() => {
   startupPollTimer = null;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
+  if (isPageVisible() && (!ws || ws.readyState !== WebSocket.OPEN)) {
     pollState();
   }
 }, 1200);
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    suspendCloseInProgress = false;
     syncOnResume();
+    return;
   }
+  clearPollTimer();
+  clearReconnectTimer();
+  clearFallbackStartTimer();
 });
 
 window.addEventListener("focus", () => {
@@ -1059,10 +1175,15 @@ window.addEventListener("focus", () => {
 });
 
 window.addEventListener("pageshow", () => {
+  suspendCloseInProgress = false;
   syncOnResume();
 });
 
 window.addEventListener("pagehide", () => {
+  suspendCloseInProgress = true;
+  clearPollTimer();
+  clearReconnectTimer();
+  clearFallbackStartTimer();
   try {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close();

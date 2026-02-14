@@ -248,6 +248,15 @@ def wlan_connect_state(wlan):
     return "pending", status
 
 
+def is_benign_socket_close(exc):
+    if not isinstance(exc, OSError):
+        return False
+    if not exc.args:
+        return False
+    code = exc.args[0]
+    return code in (32, 54, 104, 128)
+
+
 def is_setup_mode_active():
     if not ap_setup_mode:
         return False
@@ -498,7 +507,8 @@ class WebSocket:
         try:
             header = await read_exactly(self.reader, 2)
         except Exception as exc:
-            log("WS recv header error:", exc)
+            if not is_benign_socket_close(exc):
+                log("WS recv header error:", exc)
             return None
 
         b1 = header[0]
@@ -1015,21 +1025,32 @@ async def send_response(writer, status_code, content_type, body):
         "Connection: close\r\n\r\n"
     ) % (status_code, status_text, content_type, len(data))
 
-    writer.write(header.encode("utf-8"))
-    await writer.drain()
-    offset = 0
-    chunk_size = 1024
-    total = len(data)
-    while offset < total:
-        writer.write(data[offset : offset + chunk_size])
+    try:
+        writer.write(header.encode("utf-8"))
         await writer.drain()
-        offset += chunk_size
-    await close_writer(writer)
+        offset = 0
+        chunk_size = 1024
+        total = len(data)
+        while offset < total:
+            writer.write(data[offset : offset + chunk_size])
+            await writer.drain()
+            offset += chunk_size
+    except OSError as exc:
+        if not is_benign_socket_close(exc):
+            raise
+    finally:
+        await close_writer(writer)
 
 
 async def send_file(writer, path, content_type):
+    size = None
     try:
         size = os.stat(path)[6]
+    except OSError:
+        await send_response(writer, 404, "text/plain", "Not Found")
+        return
+
+    try:
         header = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: %s\r\n"
@@ -1048,12 +1069,13 @@ async def send_file(writer, path, content_type):
                     break
                 writer.write(chunk)
                 await writer.drain()
-        await close_writer(writer)
-    except OSError:
-        await send_response(writer, 404, "text/plain", "Not Found")
+    except OSError as exc:
+        if not is_benign_socket_close(exc):
+            log("send_file socket error for", path, ":", exc)
     except Exception as exc:
         log("send_file error for", path, ":", exc)
-        await send_response(writer, 500, "text/plain", "Internal Server Error")
+    finally:
+        await close_writer(writer)
 
 
 async def close_writer(writer):

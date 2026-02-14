@@ -334,6 +334,20 @@ button.control-btn.on {
   box-shadow: 0 4px 12px rgba(60, 120, 92, 0.14);
 }
 
+#standby.control-btn.standby-cta {
+  background: #e8eef9;
+  border-color: #4a6f99;
+  color: #2f4d70;
+  box-shadow: 0 6px 14px rgba(63, 98, 136, 0.24);
+}
+
+#standby.control-btn.operate-cta {
+  background: #e5f7ec;
+  border-color: #2f9d5d;
+  color: #1f6c40;
+  box-shadow: 0 6px 14px rgba(47, 157, 93, 0.24);
+}
+
 button.ghost {
   background: transparent;
   color: var(--accent);
