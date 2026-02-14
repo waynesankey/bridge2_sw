@@ -36,9 +36,18 @@ const MAX_QUEUED_LINES = 48;
 let queuedLines = [];
 let syncCooldownUntilMs = 0;
 let pendingSyncTimer = null;
+const UI_DEBOUNCE_VOL_MS = 25;
+const UI_DEBOUNCE_BAL_MS = 25;
+const UI_DEBOUNCE_BRI_MS = 40;
+const SYNC_COOLDOWN_FULL_MS = 120;
+const SYNC_COOLDOWN_STATE_MS = 80;
+const HTTP_FALLBACK_STATE_POLL_DELAY_MS = 60;
+const HTTP_FALLBACK_RETRY_BACKOFF_MS = 60;
 let lastReconnectKickMs = 0;
 const RECONNECT_KICK_MIN_INTERVAL_MS = 2000;
 let startupPollTimer = null;
+let wsHealthTimer = null;
+let wsLastMessageMs = 0;
 let muteInFlight = false;
 let standbyInFlight = false;
 let muteInFlightTimer = null;
@@ -105,7 +114,7 @@ function requestFullSync(delayMs = 0, reason = "manual") {
       pendingSyncTimer = setTimeout(run, syncCooldownUntilMs - now);
       return;
     }
-    syncCooldownUntilMs = Date.now() + 400;
+    syncCooldownUntilMs = Date.now() + SYNC_COOLDOWN_FULL_MS;
     debugWs(`full-sync (${reason})`);
     sendLine("GET STATE");
     sendLine("GET SELECTOR_LABELS");
@@ -129,7 +138,7 @@ function requestStateOnly(reason = "state-only") {
   if (now < syncCooldownUntilMs) {
     return;
   }
-  syncCooldownUntilMs = Date.now() + 250;
+  syncCooldownUntilMs = Date.now() + SYNC_COOLDOWN_STATE_MS;
   debugWs(`state-sync (${reason})`);
   sendLine("GET STATE");
 }
@@ -141,10 +150,45 @@ function syncOnResume() {
   }
   lastReconnectKickMs = now;
   if (ws && ws.readyState === WebSocket.OPEN) {
+    // iOS Safari can keep a stale OPEN socket after long sleep.
+    // Force a clean reconnect if we have not seen traffic for a while.
+    if (wsLastMessageMs && (now - wsLastMessageMs) > 45000) {
+      forceReconnectWebSocket();
+      return;
+    }
     requestStateOnly("resume");
     return;
   }
   connectWebSocket();
+}
+
+function startWsHealthTimer() {
+  if (wsHealthTimer) {
+    clearInterval(wsHealthTimer);
+  }
+  wsHealthTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const now = Date.now();
+    if (!wsLastMessageMs) {
+      wsLastMessageMs = now;
+    }
+    const idleMs = now - wsLastMessageMs;
+    if (idleMs > 20000) {
+      requestStateOnly("ws-idle");
+    }
+    if (idleMs > 45000) {
+      forceReconnectWebSocket();
+    }
+  }, 5000);
+}
+
+function stopWsHealthTimer() {
+  if (wsHealthTimer) {
+    clearInterval(wsHealthTimer);
+    wsHealthTimer = null;
+  }
 }
 
 function sendStandbyCommand(next) {
@@ -285,7 +329,7 @@ async function postCommand(line, retries = 1) {
       });
       if (res.ok) {
         // In HTTP fallback mode, pull fresh state after command ACK/STATE settles.
-        setTimeout(pollState, 180);
+        setTimeout(pollState, HTTP_FALLBACK_STATE_POLL_DELAY_MS);
         return true;
       }
     } catch (err) {
@@ -293,7 +337,7 @@ async function postCommand(line, retries = 1) {
     }
     if (attempt < retries) {
       // Brief backoff to ride out reconnect/transient network gaps.
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      await new Promise((resolve) => setTimeout(resolve, HTTP_FALLBACK_RETRY_BACKOFF_MS));
     }
   }
   return false;
@@ -715,6 +759,8 @@ function connectWebSocket() {
   ws.addEventListener("open", () => {
     debugWs("ws open");
     setStatus("Connected", true);
+    wsLastMessageMs = Date.now();
+    startWsHealthTimer();
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -729,6 +775,7 @@ function connectWebSocket() {
   ws.addEventListener("message", (event) => {
     const line = String(event.data || "").trim();
     if (!line) return;
+    wsLastMessageMs = Date.now();
     if (line.startsWith("STATE ")) {
       handleStateLine(line);
     } else if (line.startsWith("SELECTOR_LABELS")) {
@@ -813,6 +860,7 @@ function connectWebSocket() {
   ws.addEventListener("close", () => {
     debugWs("ws close");
     setStatus("Disconnected", false);
+    stopWsHealthTimer();
     if (!pollTimer) {
       pollTimer = setInterval(pollState, 1000);
     }
@@ -827,6 +875,7 @@ function connectWebSocket() {
   ws.addEventListener("error", () => {
     debugWs("ws error");
     setStatus("Error", false);
+    stopWsHealthTimer();
   });
 }
 
@@ -849,19 +898,19 @@ function forceReconnectWebSocket() {
 volumeEl.addEventListener("input", (event) => {
   const value = event.target.value;
   volumeValueEl.textContent = value;
-  scheduleSend("vol", `SET VOL ${value}`, 100);
+  scheduleSend("vol", `SET VOL ${value}`, UI_DEBOUNCE_VOL_MS);
 });
 
 balanceEl.addEventListener("input", (event) => {
   const value = event.target.value;
   balanceValueEl.textContent = value;
-  scheduleSend("bal", `SET BAL ${value}`, 100);
+  scheduleSend("bal", `SET BAL ${value}`, UI_DEBOUNCE_BAL_MS);
 });
 
 brightnessEl.addEventListener("input", (event) => {
   const value = event.target.value;
   brightnessValueEl.textContent = value;
-  scheduleSend("bri", `SET BRI ${value}`, 150);
+  scheduleSend("bri", `SET BRI ${value}`, UI_DEBOUNCE_BRI_MS);
 });
 
 muteEl.addEventListener("click", () => {
@@ -1011,4 +1060,14 @@ window.addEventListener("focus", () => {
 
 window.addEventListener("pageshow", () => {
   syncOnResume();
+});
+
+window.addEventListener("pagehide", () => {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
+  } catch (err) {
+    // ignore close errors on backgrounding
+  }
 });

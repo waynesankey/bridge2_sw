@@ -7,6 +7,7 @@ import json
 import machine
 import socket
 import gc
+import os
 from machine import UART, Pin
 
 from config import (
@@ -18,8 +19,6 @@ from config import (
     WIFI_HOSTNAME,
     WIFI_CONFIG_FILE,
     WIFI_CONNECT_TIMEOUT_MS,
-    MDNS_ENABLED,
-    MDNS_HOSTNAME,
     HTTP_HOST,
     HTTP_PORT,
     UART_ID,
@@ -34,8 +33,6 @@ from config import (
 )
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-MDNS_ADDR = "224.0.0.251"
-MDNS_PORT = 5353
 DNS_PORT = 53
 
 clients = set()
@@ -62,6 +59,19 @@ GET_DEDUP_COMMANDS = (
     "GET SELECTOR_LABELS",
     "GET AMP_STATES",
     "GET TUBES",
+)
+
+
+WLAN_STAT_IDLE = getattr(network, "STAT_IDLE", 0)
+WLAN_STAT_CONNECTING = getattr(network, "STAT_CONNECTING", 1)
+WLAN_STAT_WRONG_PASSWORD = getattr(network, "STAT_WRONG_PASSWORD", -3)
+WLAN_STAT_NO_AP_FOUND = getattr(network, "STAT_NO_AP_FOUND", -2)
+WLAN_STAT_CONNECT_FAIL = getattr(network, "STAT_CONNECT_FAIL", -1)
+WLAN_STAT_GOT_IP = getattr(network, "STAT_GOT_IP", 3)
+WLAN_TERMINAL_FAIL_STATUSES = (
+    WLAN_STAT_WRONG_PASSWORD,
+    WLAN_STAT_NO_AP_FOUND,
+    WLAN_STAT_CONNECT_FAIL,
 )
 
 AP_PAGE = """<!doctype html>
@@ -186,6 +196,68 @@ def start_ap():
     return wlan
 
 
+def reset_wifi_radios():
+    # Ensure fresh STA/AP state after soft-reload or KeyboardInterrupt.
+    try:
+        ap = network.WLAN(network.AP_IF)
+        ap.active(False)
+    except Exception:
+        pass
+    try:
+        sta = network.WLAN(network.STA_IF)
+        try:
+            sta.disconnect()
+        except Exception:
+            pass
+        sta.active(False)
+    except Exception:
+        pass
+    time.sleep_ms(120)
+
+
+def wlan_status_safe(wlan):
+    try:
+        return wlan.status()
+    except Exception:
+        return None
+
+
+def wlan_status_name(status):
+    names = {
+        WLAN_STAT_IDLE: "IDLE",
+        WLAN_STAT_CONNECTING: "CONNECTING",
+        WLAN_STAT_WRONG_PASSWORD: "WRONG_PASSWORD",
+        WLAN_STAT_NO_AP_FOUND: "NO_AP_FOUND",
+        WLAN_STAT_CONNECT_FAIL: "CONNECT_FAIL",
+        WLAN_STAT_GOT_IP: "GOT_IP",
+        None: "UNKNOWN",
+    }
+    return names.get(status, str(status))
+
+
+def wlan_connect_state(wlan):
+    if wlan is None:
+        return "failed", None
+    if wlan.isconnected():
+        return "connected", WLAN_STAT_GOT_IP
+    status = wlan_status_safe(wlan)
+    if status == WLAN_STAT_GOT_IP:
+        return "connected", status
+    if status in WLAN_TERMINAL_FAIL_STATUSES:
+        return "failed", status
+    return "pending", status
+
+
+def is_setup_mode_active():
+    if not ap_setup_mode:
+        return False
+    try:
+        ap = network.WLAN(network.AP_IF)
+        return ap.active()
+    except Exception:
+        return ap_setup_mode
+
+
 def wifi_connect(creds, force_ap):
     if force_ap or WIFI_MODE == "ap":
         return start_ap(), "ap", False
@@ -193,15 +265,16 @@ def wifi_connect(creds, force_ap):
     wlan = start_sta_connect(creds)
     if wlan:
         t0 = time.ticks_ms()
-        while not wlan.isconnected():
+        while True:
+            state, status = wlan_connect_state(wlan)
+            if state == "connected":
+                ip = wlan.ifconfig()[0]
+                log("Connected, IP:", ip)
+                return wlan, "sta", True
             if time.ticks_diff(time.ticks_ms(), t0) > WIFI_CONNECT_TIMEOUT_MS:
-                log("Wi-Fi connect timeout")
+                log("Wi-Fi connect timeout status=%s" % wlan_status_name(status))
                 break
             time.sleep_ms(250)
-        if wlan.isconnected():
-            ip = wlan.ifconfig()[0]
-            log("Connected, IP:", ip)
-            return wlan, "sta", True
 
     log("Wi-Fi not connected; check credentials")
     return wlan, "sta", False
@@ -211,6 +284,16 @@ def start_sta_connect(creds):
     global sta_wlan, sta_status
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    # Avoid multi-second latency spikes from CYW43 Wi-Fi power-save.
+    try:
+        pm_none = getattr(network, "PM_NONE", None)
+        if pm_none is None:
+            pm_none = getattr(wlan, "PM_NONE", None)
+        if pm_none is None:
+            pm_none = 0xA11140
+        wlan.config(pm=pm_none)
+    except Exception:
+        pass
     try:
         network.hostname(WIFI_HOSTNAME)
     except Exception:
@@ -240,8 +323,18 @@ async def sta_connect_task(creds):
         sta_task = None
         return
     t0 = time.ticks_ms()
-    while not wlan.isconnected():
-        if time.ticks_diff(time.ticks_ms(), t0) > WIFI_CONNECT_TIMEOUT_MS:
+    while True:
+        state, status = wlan_connect_state(wlan)
+        if state == "connected":
+            break
+        if state == "failed":
+            log("Wi-Fi connect failed (background) status=%s" % wlan_status_name(status))
+            sta_status = "failed"
+            sta_task = None
+            return
+        elapsed = time.ticks_diff(time.ticks_ms(), t0)
+        if elapsed > WIFI_CONNECT_TIMEOUT_MS:
+            log("Wi-Fi connect timeout (background) status=%s" % wlan_status_name(status))
             sta_status = "failed"
             sta_task = None
             return
@@ -253,8 +346,14 @@ async def sta_connect_task(creds):
     log("Connected, IP:", sta_ip)
     try:
         ap = network.WLAN(network.AP_IF)
+        was_active = False
+        try:
+            was_active = ap.active()
+        except Exception:
+            pass
         ap.active(False)
-        log("AP disabled after STA connect")
+        if was_active:
+            log("AP disabled after STA connect")
     except Exception:
         pass
 
@@ -708,7 +807,21 @@ async def ws_session(ws, uart):
 
 
 async def handle_http(reader, writer, uart):
-    request_line = await reader.readline()
+    try:
+        request_line = await reader.readline()
+    except OSError as exc:
+        # Mobile browsers may reset sockets while backgrounding/resuming.
+        if not exc.args or exc.args[0] != 104:
+            log("HTTP read request line error:", exc)
+        try:
+            writer.close()
+        except Exception:
+            pass
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
     if not request_line:
         try:
             writer.close()
@@ -724,7 +837,20 @@ async def handle_http(reader, writer, uart):
     log("HTTP", method, path)
     headers = {}
     while True:
-        line = await reader.readline()
+        try:
+            line = await reader.readline()
+        except OSError as exc:
+            if not exc.args or exc.args[0] != 104:
+                log("HTTP read header error:", exc)
+            try:
+                writer.close()
+            except Exception:
+                pass
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
         if not line or line in (b"\r\n", b"\n"):
             break
         try:
@@ -734,7 +860,7 @@ async def handle_http(reader, writer, uart):
             continue
 
     if headers.get("upgrade", "").lower() == "websocket":
-        if ap_setup_mode:
+        if is_setup_mode_active():
             await send_response(writer, 403, "text/plain", "Setup mode")
             return
         key = headers.get("sec-websocket-key")
@@ -849,12 +975,12 @@ async def handle_http(reader, writer, uart):
         await send_response(writer, 200, "text/plain", render_tubes_lines())
         return
 
-    if ap_setup_mode:
-        await send_response(writer, 200, "text/html", AP_PAGE.replace("__SSID__", ap_page_ssid))
-        return
-
     if path == "/" or path == "/index.html":
-        await send_file(writer, "web/index.html", "text/html")
+        if is_setup_mode_active():
+            log("Serving setup page in AP mode")
+            await send_response(writer, 200, "text/html", AP_PAGE.replace("__SSID__", ap_page_ssid))
+        else:
+            await send_file(writer, "web/index.html", "text/html")
         return
     if path == "/app.js":
         await send_file(writer, "web/app.js", "application/javascript")
@@ -875,7 +1001,10 @@ async def send_response(writer, status_code, content_type, body):
         405: "Method Not Allowed",
     }.get(status_code, "OK")
 
-    data = body.encode("utf-8")
+    if isinstance(body, bytes):
+        data = body
+    else:
+        data = body.encode("utf-8")
     header = (
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
@@ -887,8 +1016,47 @@ async def send_response(writer, status_code, content_type, body):
     ) % (status_code, status_text, content_type, len(data))
 
     writer.write(header.encode("utf-8"))
-    writer.write(data)
     await writer.drain()
+    offset = 0
+    chunk_size = 1024
+    total = len(data)
+    while offset < total:
+        writer.write(data[offset : offset + chunk_size])
+        await writer.drain()
+        offset += chunk_size
+    await close_writer(writer)
+
+
+async def send_file(writer, path, content_type):
+    try:
+        size = os.stat(path)[6]
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+            "Pragma: no-cache\r\n"
+            "Expires: 0\r\n"
+            "Connection: close\r\n\r\n"
+        ) % (content_type, size)
+        writer.write(header.encode("utf-8"))
+        await writer.drain()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        await close_writer(writer)
+    except OSError:
+        await send_response(writer, 404, "text/plain", "Not Found")
+    except Exception as exc:
+        log("send_file error for", path, ":", exc)
+        await send_response(writer, 500, "text/plain", "Internal Server Error")
+
+
+async def close_writer(writer):
     try:
         writer.close()
     except Exception:
@@ -897,15 +1065,6 @@ async def send_response(writer, status_code, content_type, body):
         await writer.wait_closed()
     except Exception:
         pass
-
-
-async def send_file(writer, path, content_type):
-    try:
-        with open(path, "r") as f:
-            body = f.read()
-        await send_response(writer, 200, content_type, body)
-    except OSError:
-        await send_response(writer, 404, "text/plain", "Not Found")
 
 
 def parse_form(body):
@@ -979,47 +1138,6 @@ def decode_dns_name(data, offset):
     return name, (jump_offset if jumped else offset)
 
 
-def build_mdns_response(data, ip, hostname):
-    if len(data) < 12:
-        return None
-    qdcount = (data[4] << 8) | data[5]
-    if qdcount < 1:
-        return None
-
-    qname, qend = decode_dns_name(data, 12)
-    if not qname:
-        return None
-    if qend + 4 > len(data):
-        return None
-    qtype = (data[qend] << 8) | data[qend + 1]
-    qclass = (data[qend + 2] << 8) | data[qend + 3]
-
-    target = hostname.lower() + ".local"
-    if qname.lower().rstrip(".") != target:
-        return None
-    if qtype not in (1, 255):  # A or ANY
-        return None
-
-    question = data[12 : qend + 4]
-    ip_bytes = bytes(int(part) for part in ip.split("."))
-
-    resp = bytearray()
-    resp += data[0:2]            # ID
-    resp += b"\x84\x00"          # QR=1, AA=1
-    resp += b"\x00\x01"          # QDCOUNT
-    resp += b"\x00\x01"          # ANCOUNT
-    resp += b"\x00\x00"          # NSCOUNT
-    resp += b"\x00\x00"          # ARCOUNT
-    resp += question
-    resp += b"\xC0\x0C"          # NAME (pointer to qname)
-    resp += b"\x00\x01"          # TYPE A
-    resp += b"\x80\x01"          # CLASS IN with cache flush
-    resp += b"\x00\x00\x00\x78"  # TTL 120s
-    resp += b"\x00\x04"          # RDLENGTH
-    resp += ip_bytes
-    return resp
-
-
 def build_dns_captive_response(data, ip):
     if len(data) < 12:
         return None
@@ -1059,62 +1177,9 @@ def build_dns_captive_response(data, ip):
     return resp
 
 
-async def mdns_task(ip, hostname):
-    # If the firmware provides mDNS, use it (preferred).
-    try:
-        import mdns  # type: ignore
-        mdns_server = mdns.Server()
-        mdns_server.start(hostname, "Pico W")
-        mdns_server.add_service("_http", "_tcp", HTTP_PORT, {})
-        log("mDNS (firmware) active:", hostname + ".local")
-        while True:
-            await asyncio.sleep(60)
-    except Exception:
-        pass
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            ip_ttl = getattr(socket, "IP_MULTICAST_TTL", None)
-            ip_add = getattr(socket, "IP_ADD_MEMBERSHIP", None)
-            if ip_ttl is not None:
-                sock.setsockopt(socket.IPPROTO_IP, ip_ttl, 255)
-            if ip_add is not None:
-                inet_aton = getattr(socket, "inet_aton", None)
-                if inet_aton is not None:
-                    mreq = inet_aton(MDNS_ADDR) + inet_aton("0.0.0.0")
-                    sock.setsockopt(socket.IPPROTO_IP, ip_add, mreq)
-        except Exception:
-            pass
-        sock.bind(("0.0.0.0", MDNS_PORT))
-        sock.setblocking(False)
-    except Exception as exc:
-        if "EADDRINUSE" in str(exc):
-            log("mDNS port in use; firmware mDNS likely active:", WIFI_HOSTNAME + ".local")
-        else:
-            log("mDNS disabled:", exc)
-        return
-
-    log("mDNS responder active:", hostname + ".local")
-
-    while True:
-        try:
-            data, addr = sock.recvfrom(512)
-        except OSError:
-            await asyncio.sleep_ms(50)
-            continue
-        if not data:
-            continue
-        resp = build_mdns_response(data, ip, hostname)
-        if resp:
-            try:
-                sock.sendto(resp, (MDNS_ADDR, MDNS_PORT))
-            except Exception:
-                pass
-
-
 async def captive_dns_task(ip):
+    global ap_setup_mode
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1126,20 +1191,30 @@ async def captive_dns_task(ip):
 
     log("Captive DNS active on port", DNS_PORT)
 
-    while True:
-        try:
-            data, addr = sock.recvfrom(512)
-        except OSError:
-            await asyncio.sleep_ms(50)
-            continue
-        if not data:
-            continue
-        resp = build_dns_captive_response(data, ip)
-        if resp:
+    try:
+        while True:
+            if not ap_setup_mode:
+                break
             try:
-                sock.sendto(resp, addr)
+                data, addr = sock.recvfrom(512)
+            except OSError:
+                await asyncio.sleep_ms(50)
+                continue
+            if not data:
+                continue
+            resp = build_dns_captive_response(data, ip)
+            if resp:
+                try:
+                    sock.sendto(resp, addr)
+                except Exception:
+                    pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
             except Exception:
                 pass
+        log("Captive DNS stopped")
 
 
 async def main():
@@ -1168,8 +1243,14 @@ async def main():
     elif mode == "sta" and sta_connected and not ap_setup_mode:
         try:
             ap = network.WLAN(network.AP_IF)
+            was_active = False
+            try:
+                was_active = ap.active()
+            except Exception:
+                pass
             ap.active(False)
-            log("AP disabled (STA connected at boot)")
+            if was_active:
+                log("AP disabled (STA connected at boot)")
         except Exception:
             pass
     uart = uart_init()
@@ -1186,11 +1267,7 @@ async def main():
     )
     log("HTTP server listening on", HTTP_HOST, HTTP_PORT)
 
-    if mode == "sta" and sta_connected and MDNS_ENABLED:
-        ip = wlan.ifconfig()[0]
-        asyncio.create_task(mdns_task(ip, MDNS_HOSTNAME))
-
-    if mode == "ap":
+    if ap_setup_mode:
         ap_ip = wlan.ifconfig()[0]
         asyncio.create_task(captive_dns_task(ap_ip))
         log("AP mode config: connect to", WIFI_AP_SSID, "and open http://", ap_ip)
@@ -1203,4 +1280,5 @@ async def main():
 try:
     asyncio.run(main())
 finally:
+    reset_wifi_radios()
     asyncio.new_event_loop()
